@@ -8,12 +8,12 @@ import (
 	"log"
 	"os"
 	"strings"
+	"uuid"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/lambda/types"
-	"github.com/google/uuid"
 	"github.com/gosom/google-maps-scraper/runner"
 )
 
@@ -107,7 +107,7 @@ func (i *invoker) setPayloads(cfg *runner.Config) error {
 	var currentChunk []string
 
 	chunkNumber := 0
-	jobID := uuid.New().String()
+	jobID := uuid.NewV4().String()
 
 	for scanner.Scan() {
 		keyword := strings.TrimSpace(scanner.Text())
@@ -120,15 +120,18 @@ func (i *invoker) setPayloads(cfg *runner.Config) error {
 		// When we reach chunkSize or EOF, create a new payload
 		if len(currentChunk) >= chunkSize {
 			payload := lInput{
-				JobID:        jobID,
-				Part:         chunkNumber,
-				BucketName:   cfg.S3Bucket,
-				Keywords:     currentChunk,
-				Depth:        cfg.MaxDepth,
-				Concurrency:  cfg.Concurrency,
-				Language:     cfg.LangCode,
-				FunctionName: cfg.FunctionName,
-				ExtraReviews: cfg.ExtraReviews,
+				JobID:              jobID,
+				Part:               chunkNumber,
+				BucketName:         cfg.S3Bucket,
+				Keywords:           currentChunk,
+				Depth:              cfg.MaxDepth,
+				Concurrency:        cfg.Concurrency,
+				Language:           cfg.LangCode,
+				FunctionName:       cfg.FunctionName,
+				DisablePageReuse:   cfg.DisablePageReuse,
+				ExtraReviews:       cfg.ExtraReviews,
+				BrowserPoolSize:    cfg.BrowserPoolSize,
+				MaxPagesPerBrowser: cfg.MaxPagesPerBrowser,
 			}
 			i.payloads = append(i.payloads, payload)
 
@@ -139,15 +142,18 @@ func (i *invoker) setPayloads(cfg *runner.Config) error {
 
 	if len(currentChunk) > 0 {
 		payload := lInput{
-			JobID:        jobID,
-			Part:         chunkNumber,
-			BucketName:   cfg.S3Bucket,
-			Keywords:     currentChunk,
-			Depth:        cfg.MaxDepth,
-			Concurrency:  cfg.Concurrency,
-			Language:     cfg.LangCode,
-			FunctionName: cfg.FunctionName,
-			ExtraReviews: cfg.ExtraReviews,
+			JobID:              jobID,
+			Part:               chunkNumber,
+			BucketName:         cfg.S3Bucket,
+			Keywords:           currentChunk,
+			Depth:              cfg.MaxDepth,
+			Concurrency:        cfg.Concurrency,
+			Language:           cfg.LangCode,
+			FunctionName:       cfg.FunctionName,
+			DisablePageReuse:   cfg.DisablePageReuse,
+			ExtraReviews:       cfg.ExtraReviews,
+			BrowserPoolSize:    cfg.BrowserPoolSize,
+			MaxPagesPerBrowser: cfg.MaxPagesPerBrowser,
 		}
 		i.payloads = append(i.payloads, payload)
 	}

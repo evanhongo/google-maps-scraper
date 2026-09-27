@@ -16,10 +16,12 @@ import (
 	"github.com/mattn/go-runewidth"
 	"golang.org/x/term"
 
+	"github.com/gosom/google-maps-scraper/internal/proxyconfig"
 	"github.com/gosom/google-maps-scraper/s3uploader"
 	"github.com/gosom/google-maps-scraper/tlmt"
 	"github.com/gosom/google-maps-scraper/tlmt/gonoop"
 	"github.com/gosom/google-maps-scraper/tlmt/goposthog"
+	"github.com/gosom/scrapemate/scrapemateapp"
 )
 
 const (
@@ -81,6 +83,9 @@ type Config struct {
 	DisablePageReuse         bool
 	ExtraReviews             bool
 	LeadsDBAPIKey            string
+	BrowserPoolSize          int
+	MaxPagesPerBrowser       int
+	Resume                   bool
 
 	// Grid scraping — divide a bounding box into cells to bypass the ~120
 	// results-per-search limit imposed by Google Maps.
@@ -100,7 +105,8 @@ func ParseConfig() *Config {
 	}
 
 	var (
-		proxies string
+		proxies     string
+		proxiesFile string
 	)
 
 	flag.IntVar(&cfg.Concurrency, "c", min(runtime.NumCPU()/2, 1), "sets the concurrency [default: half of CPU cores]")
@@ -121,6 +127,7 @@ func ParseConfig() *Config {
 	flag.BoolVar(&cfg.WebRunner, "web", false, "run web server instead of crawling")
 	flag.StringVar(&cfg.DataFolder, "data-folder", "webdata", "data folder for web runner")
 	flag.StringVar(&proxies, "proxies", "", "comma separated list of proxies to use in the format protocol://user:pass@host:port example: socks5://localhost:9050 or http://user:pass@localhost:9050")
+	flag.StringVar(&proxiesFile, "proxies-file", "", "path to a file containing one proxy URL per line")
 	flag.BoolVar(&cfg.AwsLamdbaRunner, "aws-lambda", false, "run as AWS Lambda function")
 	flag.BoolVar(&cfg.AwsLambdaInvoker, "aws-lambda-invoker", false, "run as AWS Lambda invoker")
 	flag.StringVar(&cfg.FunctionName, "function-name", "", "AWS Lambda function name")
@@ -135,8 +142,11 @@ func ParseConfig() *Config {
 	flag.BoolVar(&cfg.DisablePageReuse, "disable-page-reuse", false, "disable page reuse in playwright")
 	flag.BoolVar(&cfg.ExtraReviews, "extra-reviews", false, "enable extra reviews collection")
 	flag.StringVar(&cfg.LeadsDBAPIKey, "leadsdb-api-key", "", "LeadsDB API key for exporting results to LeadsDB")
+	flag.BoolVar(&cfg.Resume, "resume", false, "resume a CLI file scrape by reading existing results and appending missing places")
 	flag.StringVar(&cfg.GridBBox, "grid-bbox", "", "bounding box for grid scraping: 'minLat,minLon,maxLat,maxLon' (e.g. '40.30,-3.80,40.50,-3.60')")
 	flag.Float64Var(&cfg.GridCellKm, "grid-cell", 1.0, "grid cell size in km [default: 1.0]. Use with -grid-bbox")
+	flag.IntVar(&cfg.BrowserPoolSize, "browser-pool-size", 0, "number of browser contexts for JS mode; 0 derives from concurrency and pages-per-browser")
+	flag.IntVar(&cfg.MaxPagesPerBrowser, "pages-per-browser", 1, "maximum concurrent pages per browser context in JS mode")
 	flag.BoolVar(&cfg.Version, "version", false, "returns the version of the tool")
 
 	flag.Parse()
@@ -203,9 +213,12 @@ func ParseConfig() *Config {
 		panic("Dsn must be provided when using ProduceOnly")
 	}
 
-	if proxies != "" {
-		cfg.Proxies = strings.Split(proxies, ",")
+	resolvedProxies, err := proxyconfig.Resolve(proxies, proxiesFile)
+	if err != nil {
+		panic(err)
 	}
+
+	cfg.Proxies = resolvedProxies
 
 	if cfg.AwsAccessKey != "" && cfg.AwsSecretKey != "" && cfg.AwsRegion != "" {
 		cfg.S3Uploader = s3uploader.New(cfg.AwsAccessKey, cfg.AwsSecretKey, cfg.AwsRegion)
@@ -302,7 +315,7 @@ func banner(messages []string, width int) string {
 
 	contentWidth := width - 4
 
-	var wrappedLines []string
+	wrappedLines := make([]string, 0, len(messages))
 	for _, message := range messages {
 		wrappedLines = append(wrappedLines, wrapText(message, contentWidth)...)
 	}
@@ -319,12 +332,24 @@ func banner(messages []string, width int) string {
 			paddingRight = 0
 		}
 
-		builder.WriteString(fmt.Sprintf("║ %s%s ║\n", line, strings.Repeat(" ", paddingRight)))
+		fmt.Fprintf(&builder, "║ %s%s ║\n", line, strings.Repeat(" ", paddingRight))
 	}
 
 	builder.WriteString("╚" + strings.Repeat("═", width-2) + "╝\n")
 
 	return builder.String()
+}
+
+func AppendBrowserCapacityOptions(opts []func(*scrapemateapp.Config) error, cfg *Config) []func(*scrapemateapp.Config) error {
+	if cfg.MaxPagesPerBrowser > 1 {
+		opts = append(opts, scrapemateapp.WithMaxPagesPerBrowser(cfg.MaxPagesPerBrowser))
+	}
+
+	if cfg.BrowserPoolSize > 0 {
+		opts = append(opts, scrapemateapp.WithBrowserPoolSize(cfg.BrowserPoolSize))
+	}
+
+	return opts
 }
 
 func Banner() {

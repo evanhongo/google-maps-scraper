@@ -7,13 +7,18 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"uuid"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/google/uuid"
 	"github.com/gosom/scrapemate"
 
 	"github.com/gosom/google-maps-scraper/deduper"
 	"github.com/gosom/google-maps-scraper/exiter"
+)
+
+const (
+	requestMethodGet   = "GET"
+	languageQueryParam = "hl"
 )
 
 type GmapJobOptions func(*GmapJob)
@@ -29,6 +34,7 @@ type GmapJob struct {
 	ExitMonitor             exiter.Exiter
 	ExtractExtraReviews     bool
 	WriterManagedCompletion bool
+	CompletionTracker       CompletionTracker
 }
 
 func NewGmapJob(
@@ -39,7 +45,19 @@ func NewGmapJob(
 	zoom int,
 	opts ...GmapJobOptions,
 ) *GmapJob {
-	query = url.QueryEscape(query)
+	var mapURL string
+
+	switch {
+	case isGoogleMapsURL(query):
+		mapURL = sanitizePlaceURL(strings.TrimSpace(query))
+	case geoCoordinates != "" && zoom > 0:
+		query = url.QueryEscape(query)
+		mapURL = fmt.Sprintf("https://www.google.com/maps/search/%s/@%s,%dz", query, strings.ReplaceAll(geoCoordinates, " ", ""), zoom)
+	default:
+		// Warning: geo and zoom MUST be both set or not
+		query = url.QueryEscape(query)
+		mapURL = fmt.Sprintf("https://www.google.com/maps/search/%s", query)
+	}
 
 	const (
 		maxRetries = 3
@@ -47,15 +65,7 @@ func NewGmapJob(
 	)
 
 	if id == "" {
-		id = uuid.New().String()
-	}
-
-	mapURL := ""
-	if geoCoordinates != "" && zoom > 0 {
-		mapURL = fmt.Sprintf("https://www.google.com/maps/search/%s/@%s,%dz", query, strings.ReplaceAll(geoCoordinates, " ", ""), zoom)
-	} else {
-		// Warning: geo and zoom MUST be both set or not
-		mapURL = fmt.Sprintf("https://www.google.com/maps/search/%s", query)
+		id = uuid.NewV4().String()
 	}
 
 	job := GmapJob{
@@ -63,7 +73,7 @@ func NewGmapJob(
 			ID:         id,
 			Method:     http.MethodGet,
 			URL:        mapURL,
-			URLParams:  map[string]string{"hl": langCode},
+			URLParams:  map[string]string{languageQueryParam: langCode},
 			MaxRetries: maxRetries,
 			Priority:   prio,
 		},
@@ -100,6 +110,12 @@ func WithExtraReviews() GmapJobOptions {
 func WithWriterManagedCompletion() GmapJobOptions {
 	return func(j *GmapJob) {
 		j.WriterManagedCompletion = true
+	}
+}
+
+func WithGmapCompletionTracker(tracker CompletionTracker) GmapJobOptions {
+	return func(j *GmapJob) {
+		j.CompletionTracker = tracker
 	}
 }
 
@@ -175,6 +191,10 @@ func (j *GmapJob) Process(ctx context.Context, resp *scrapemate.Response) (any, 
 	if j.ExitMonitor != nil {
 		j.ExitMonitor.IncrPlacesFound(len(next))
 		j.ExitMonitor.IncrSeedCompleted(1)
+	}
+
+	if j.CompletionTracker != nil {
+		_ = j.CompletionTracker.SeedDiscovered(j.ID, len(next))
 	}
 
 	log.Info(fmt.Sprintf("%d places found", len(next)))
@@ -339,6 +359,7 @@ func scroll(ctx context.Context,
 
 		// Handle both int and float64 because browser-evaluated numbers may arrive as either type.
 		var height int
+
 		switch v := scrollHeight.(type) {
 		case int:
 			height = v
@@ -370,4 +391,32 @@ func scroll(ctx context.Context,
 	}
 
 	return cnt, nil
+}
+
+func isGoogleMapsURL(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		u, err := url.Parse(s)
+		if err != nil {
+			return false
+		}
+
+		host := strings.ToLower(u.Hostname())
+		if host == "maps.app.goo.gl" {
+			return true
+		}
+
+		return (host == "google.com" || strings.HasSuffix(host, ".google.com")) &&
+			(strings.Contains(u.EscapedPath(), "/maps") || strings.Contains(u.Path, "/maps"))
+	}
+
+	if strings.HasPrefix(s, "maps.app.goo.gl") {
+		return true
+	}
+
+	return false
 }

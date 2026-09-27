@@ -1,9 +1,11 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -15,12 +17,16 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/google/uuid"
+	"uuid"
 )
 
 //go:embed static
 var static embed.FS
+
+const (
+	jobsPageLimit           = 20
+	methodNotAllowedMessage = "Method not allowed"
+)
 
 type Server struct {
 	tmpl map[string]*template.Template
@@ -63,6 +69,11 @@ func New(svc *Service, addr string) (*Server, error) {
 		ans.delete(w, r)
 	})
 	mux.HandleFunc("/jobs", ans.getJobs)
+	mux.HandleFunc("/view", func(w http.ResponseWriter, r *http.Request) {
+		r = requestWithID(r)
+
+		ans.viewJob(w, r)
+	})
 	mux.HandleFunc("/", ans.index)
 
 	// api routes
@@ -76,7 +87,7 @@ func New(svc *Service, addr string) (*Server, error) {
 		default:
 			ans := apiError{
 				Code:    http.StatusMethodNotAllowed,
-				Message: "Method not allowed",
+				Message: methodNotAllowedMessage,
 			}
 
 			renderJSON(w, http.StatusMethodNotAllowed, ans)
@@ -94,7 +105,7 @@ func New(svc *Service, addr string) (*Server, error) {
 		default:
 			ans := apiError{
 				Code:    http.StatusMethodNotAllowed,
-				Message: "Method not allowed",
+				Message: methodNotAllowedMessage,
 			}
 
 			renderJSON(w, http.StatusMethodNotAllowed, ans)
@@ -107,7 +118,7 @@ func New(svc *Service, addr string) (*Server, error) {
 		if r.Method != http.MethodGet {
 			ans := apiError{
 				Code:    http.StatusMethodNotAllowed,
-				Message: "Method not allowed",
+				Message: methodNotAllowedMessage,
 			}
 
 			renderJSON(w, http.StatusMethodNotAllowed, ans)
@@ -125,6 +136,7 @@ func New(svc *Service, addr string) (*Server, error) {
 		"static/templates/index.html",
 		"static/templates/job_rows.html",
 		"static/templates/job_row.html",
+		"static/templates/job_view.html",
 		"static/templates/redoc.html",
 	}
 
@@ -141,10 +153,13 @@ func New(svc *Service, addr string) (*Server, error) {
 }
 
 func (s *Server) Start(ctx context.Context) error {
-	go func() {
-		<-ctx.Done()
+	go func(shutdownSource context.Context) {
+		<-shutdownSource.Done()
 
-		err := s.srv.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(shutdownSource), 10*time.Second)
+		defer cancel()
+
+		err := s.srv.Shutdown(shutdownCtx)
 		if err != nil {
 			log.Println(err)
 
@@ -152,7 +167,7 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 
 		log.Println("server stopped")
-	}()
+	}(ctx)
 
 	fmt.Fprintf(os.Stderr, "visit http://localhost%s\n", s.srv.Addr)
 
@@ -215,7 +230,7 @@ func (f formData) KeywordsString() string {
 
 func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, methodNotAllowedMessage, http.StatusMethodNotAllowed)
 
 		return
 	}
@@ -246,7 +261,7 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) scrape(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, methodNotAllowedMessage, http.StatusMethodNotAllowed)
 
 		return
 	}
@@ -259,7 +274,7 @@ func (s *Server) scrape(w http.ResponseWriter, r *http.Request) {
 	}
 
 	newJob := Job{
-		ID:     uuid.New().String(),
+		ID:     uuid.NewV4().String(),
 		Name:   r.Form.Get("name"),
 		Date:   time.Now().UTC(),
 		Status: StatusPending,
@@ -358,42 +373,58 @@ func (s *Server) scrape(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmpl, ok := s.tmpl["static/templates/job_row.html"]
-	if !ok {
-		http.Error(w, "missing tpl", http.StatusInternalServerError)
+	if err := s.renderJobsPage(r.Context(), w, 1); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
 
-		return
+func (s *Server) renderJobsPage(ctx context.Context, w io.Writer, page int) error {
+	tmpl, ok := s.tmpl["static/templates/job_rows.html"]
+	if !ok {
+		return errors.New("missing tpl")
 	}
 
-	_ = tmpl.Execute(w, newJob)
+	jobPage, err := s.svc.ListJobs(ctx, page, jobsPageLimit)
+	if err != nil {
+		return fmt.Errorf("list jobs: %w", err)
+	}
+
+	var output bytes.Buffer
+	if err := tmpl.Execute(&output, jobPage); err != nil {
+		return fmt.Errorf("render jobs: %w", err)
+	}
+
+	if _, err := output.WriteTo(w); err != nil {
+		return fmt.Errorf("write jobs: %w", err)
+	}
+
+	return nil
+}
+
+func pageFromRequest(r *http.Request) int {
+	page, err := strconv.Atoi(r.URL.Query().Get("page"))
+	if err != nil || page < 1 {
+		return 1
+	}
+
+	return page
 }
 
 func (s *Server) getJobs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, methodNotAllowedMessage, http.StatusMethodNotAllowed)
 
 		return
 	}
 
-	tmpl, ok := s.tmpl["static/templates/job_rows.html"]
-	if !ok {
-		http.Error(w, "missing tpl", http.StatusInternalServerError)
-		return
-	}
-
-	jobs, err := s.svc.All(context.Background())
-	if err != nil {
+	if err := s.renderJobsPage(r.Context(), w, pageFromRequest(r)); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-
-		return
 	}
-
-	_ = tmpl.Execute(w, jobs)
 }
 
 func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, methodNotAllowedMessage, http.StatusMethodNotAllowed)
 
 		return
 	}
@@ -413,7 +444,7 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	file, err := os.Open(filePath)
+	file, err := os.Open(filePath) //nolint:gosec // GetCSV returns a validated path rooted in the configured data directory.
 	if err != nil {
 		http.Error(w, "Failed to open file", http.StatusInternalServerError)
 		return
@@ -433,7 +464,7 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, methodNotAllowedMessage, http.StatusMethodNotAllowed)
 
 		return
 	}
@@ -452,7 +483,9 @@ func (s *Server) delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	if err := s.renderJobsPage(r.Context(), w, pageFromRequest(r)); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 }
 
 type apiError struct {
@@ -496,7 +529,7 @@ func (s *Server) apiScrape(w http.ResponseWriter, r *http.Request) {
 	}
 
 	newJob := Job{
-		ID:     uuid.New().String(),
+		ID:     uuid.NewV4().String(),
 		Name:   req.Name,
 		Date:   time.Now().UTC(),
 		Status: StatusPending,
@@ -581,6 +614,53 @@ func (s *Server) apiGetJob(w http.ResponseWriter, r *http.Request) {
 	renderJSON(w, http.StatusOK, job)
 }
 
+// viewJob renders the map modal fragment for a job, embedding the job's places
+// directly so the client needs no separate data request.
+func (s *Server) viewJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, methodNotAllowedMessage, http.StatusMethodNotAllowed)
+
+		return
+	}
+
+	id, ok := getIDFromRequest(r)
+	if !ok {
+		http.Error(w, "Invalid ID", http.StatusUnprocessableEntity)
+
+		return
+	}
+
+	places, err := s.svc.GetPlaces(r.Context(), id.String())
+	if err != nil {
+		if !errors.Is(err, ErrPlacesNotFound) {
+			log.Printf("view job %s: %v", id, err) //nolint:gosec // id is a parsed UUID and cannot contain log control characters.
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+
+			return
+		}
+
+		// No CSV yet: render the modal with an empty state rather than an error.
+		places = []Place{}
+	}
+
+	tmpl, ok := s.tmpl["static/templates/job_view.html"]
+	if !ok {
+		http.Error(w, "missing tpl", http.StatusInternalServerError)
+
+		return
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, places); err != nil {
+		log.Printf("view job %s: render: %v", id, err) //nolint:gosec // id is a parsed UUID and cannot contain log control characters.
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+
+		return
+	}
+
+	_, _ = buf.WriteTo(w)
+}
+
 func (s *Server) apiDeleteJob(w http.ResponseWriter, r *http.Request) {
 	id, ok := getIDFromRequest(r)
 	if !ok {
@@ -629,8 +709,8 @@ func securityHeaders(next http.Handler) http.Handler {
 			"default-src 'self'; "+
 				"script-src 'self' cdn.redoc.ly cdnjs.cloudflare.com 'unsafe-inline' 'unsafe-eval'; "+
 				"worker-src 'self' blob:; "+
-				"style-src 'self' 'unsafe-inline' fonts.googleapis.com; "+
-				"img-src 'self' data: cdn.redoc.ly; "+
+				"style-src 'self' 'unsafe-inline' fonts.googleapis.com cdnjs.cloudflare.com; "+
+				"img-src 'self' data: cdn.redoc.ly cdnjs.cloudflare.com *.tile.openstreetmap.org; "+
 				"font-src 'self' fonts.gstatic.com; "+
 				"connect-src 'self'")
 

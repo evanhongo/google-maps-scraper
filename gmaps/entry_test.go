@@ -1,8 +1,10 @@
 package gmaps_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/PuerkitoBio/goquery"
@@ -121,6 +123,7 @@ func Test_EntryFromJSON(t *testing.T) {
 			State:      "",
 			Country:    "CY",
 		},
+		CreditCardsAccepted: []string{"Mastercard"},
 		ReviewsPerRating: map[int]int{
 			1: 37,
 			2: 16,
@@ -203,6 +206,98 @@ func Test_EntryFromJSONRaw2(t *testing.T) {
 	require.Greater(t, len(entry.About), 0)
 }
 
+func Test_EntryFromJSONExtractsAcceptedCreditCards(t *testing.T) {
+	raw, err := os.ReadFile("../testdata/panic2.json")
+	require.NoError(t, err)
+	require.NotEmpty(t, raw)
+
+	entry, err := gmaps.EntryFromJSON(raw)
+	require.NoError(t, err)
+
+	require.Equal(t, []string{"American Express", "Diners Club", "Mastercard", "VISA"}, entry.CreditCardsAccepted)
+}
+
+func Test_EntryFromJSONMergesDuplicateAboutOptions(t *testing.T) {
+	raw, err := os.ReadFile("../testdata/panic2.json")
+	require.NoError(t, err)
+	require.NotEmpty(t, raw)
+
+	entry, err := gmaps.EntryFromJSON(raw)
+	require.NoError(t, err)
+
+	var payments gmaps.About
+
+	for _, about := range entry.About {
+		if about.ID == "payments" {
+			payments = about
+			break
+		}
+	}
+
+	require.NotEmpty(t, payments.ID)
+
+	creditCardsCount := 0
+
+	var creditCards gmaps.Option
+
+	for _, opt := range payments.Options {
+		if opt.Name == "Credit cards" {
+			creditCardsCount++
+			creditCards = opt
+		}
+	}
+
+	require.Equal(t, 1, creditCardsCount)
+	require.True(t, creditCards.Enabled)
+	require.Equal(t, []string{"American Express", "Diners Club", "Mastercard", "VISA"}, creditCards.Values)
+}
+
+func Test_EntryCSVIncludesCreditCardsAccepted(t *testing.T) {
+	entry := gmaps.Entry{
+		CreditCardsAccepted: []string{"American Express", "Mastercard", "VISA"},
+	}
+
+	require.Contains(t, entry.CsvHeaders(), "credit_cards_accepted")
+	require.Equal(t, len(entry.CsvHeaders()), len(entry.CsvRow()))
+	require.Equal(t,
+		"American Express, Mastercard, VISA",
+		entry.CsvRow()[slices.Index(entry.CsvHeaders(), "credit_cards_accepted")],
+	)
+}
+
+func Test_EntryMarshalEmitsBothLongitudeKeys(t *testing.T) {
+	entry := gmaps.Entry{Title: "x", Category: "y", Latitude: 1.5, Longtitude: 2.5}
+
+	raw, err := json.Marshal(entry)
+	require.NoError(t, err)
+
+	var got map[string]json.RawMessage
+
+	require.NoError(t, json.Unmarshal(raw, &got))
+
+	require.JSONEq(t, "2.5", string(got["longtitude"]), "legacy key preserved")
+	require.JSONEq(t, "2.5", string(got["longitude"]), "correctly spelled alias emitted")
+}
+
+func Test_EntryUnmarshalAcceptsEitherLongitudeKey(t *testing.T) {
+	var legacy gmaps.Entry
+
+	require.NoError(t, json.Unmarshal([]byte(`{"longtitude":42.5}`), &legacy))
+	require.Equal(t, 42.5, legacy.Longtitude)
+
+	var modern gmaps.Entry
+
+	require.NoError(t, json.Unmarshal([]byte(`{"longitude":42.5}`), &modern))
+	require.Equal(t, 42.5, modern.Longtitude)
+
+	// When both are present, the legacy spelling wins so existing files
+	// round-trip byte-identical.
+	var both gmaps.Entry
+
+	require.NoError(t, json.Unmarshal([]byte(`{"longtitude":1.0,"longitude":2.0}`), &both))
+	require.Equal(t, 1.0, both.Longtitude)
+}
+
 func Test_EntryFromJsonC(t *testing.T) {
 	raw, err := os.ReadFile("../testdata/output.json")
 
@@ -216,4 +311,18 @@ func Test_EntryFromJsonC(t *testing.T) {
 	for _, entry := range entries {
 		fmt.Printf("%+v\n", entry)
 	}
+}
+
+func Test_EntryFromJSONStatusFallback(t *testing.T) {
+	// Places where [34][4][4] is absent carry the closed-state enum at [88][0].
+	darray := make([]any, 89)
+	darray[88] = []any{"CLOSED"}
+	jd := []any{nil, nil, nil, nil, nil, nil, darray}
+
+	raw, err := json.Marshal(jd)
+	require.NoError(t, err)
+
+	entry, err := gmaps.EntryFromJSON(raw)
+	require.NoError(t, err)
+	require.Equal(t, "CLOSED", entry.Status)
 }

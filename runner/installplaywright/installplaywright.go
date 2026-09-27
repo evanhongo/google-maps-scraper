@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/gosom/google-maps-scraper/runner"
-	"github.com/playwright-community/playwright-go"
+	"github.com/mxschmitt/playwright-go"
 )
 
 type installer struct {
